@@ -27,3 +27,78 @@ jobs:
         with:
           name: WiiUEmu-debug-apk
           path: WiiUEmuAndroid/app/build/outputs/apk/debug/app-debug.apk
+
+  # ------------------------------------------------------------------
+  # Núcleo do Fractal (fork do Cemu para Android, dfdx047/Fractal, MPL-2.0)
+  # Compila o Fractal inteiro (núcleo nativo + app) e gera o APK.
+  # O job "build" acima (núcleo próprio antigo) continua intacto.
+  # ------------------------------------------------------------------
+  fractal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      FRACTAL_REPO: https://github.com/dfdx047/Fractal.git
+      FRACTAL_REF: main            # troque por v0.1-beta para fixar a versão
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Dependências do sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake nasm autoconf automake libtool \
+            pkg-config curl zip unzip tar git python3 bison flex
+      - name: Instalar SDK/NDK
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses > /dev/null || true
+          "$SM" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/26.1.10909125" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$SDK/ndk/26.1.10909125" >> "$GITHUB_ENV"
+      - name: Baixar o Fractal
+        run: |
+          git clone --recursive --depth 1 --branch "$FRACTAL_REF" "$FRACTAL_REPO" Fractal \
+            || { git clone --recursive "$FRACTAL_REPO" Fractal && git -C Fractal checkout "$FRACTAL_REF"; }
+          git -C Fractal submodule update --init --recursive
+          git -C Fractal log -1 --oneline
+      - name: Localizar o projeto Android
+        run: |
+          # procura a pasta com gradlew + módulo app (o port Android do Cemu usa src/android)
+          DIR=""
+          for c in Fractal/src/android Fractal/android Fractal; do
+            if [ -f "$c/settings.gradle" ] || [ -f "$c/settings.gradle.kts" ]; then DIR="$c"; break; fi
+          done
+          if [ -z "$DIR" ]; then
+            S=$(find Fractal -maxdepth 4 \( -name settings.gradle -o -name settings.gradle.kts \) | head -1)
+            DIR=$(dirname "$S")
+          fi
+          echo "Projeto Android: $DIR"
+          echo "ANDROID_PROJECT=$DIR" >> "$GITHUB_ENV"
+          ls -la "$DIR"
+      - name: vcpkg
+        run: |
+          if [ -d Fractal/dependencies/vcpkg ] && [ -f Fractal/dependencies/vcpkg/bootstrap-vcpkg.sh ]; then
+            VC="$GITHUB_WORKSPACE/Fractal/dependencies/vcpkg"
+          else
+            git clone --depth 1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+            VC="$HOME/vcpkg"
+          fi
+          "$VC/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$VC" >> "$GITHUB_ENV"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Compilar
+        working-directory: ${{ env.ANDROID_PROJECT }}
+        run: |
+          chmod +x ./gradlew 2>/dev/null || true
+          if [ -x ./gradlew ]; then G=./gradlew; else G=gradle; fi
+          $G assembleDebug --no-daemon --stacktrace
+      - name: Juntar APKs
+        run: |
+          mkdir -p out
+          find "$ANDROID_PROJECT" -path '*outputs/apk*' -name '*.apk' -exec cp {} out/ \;
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Fractal-core-debug-apk
+          path: out/*.apk
+          if-no-files-found: error
